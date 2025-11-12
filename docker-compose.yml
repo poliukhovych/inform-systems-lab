@@ -10,40 +10,81 @@ services:
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
     ports:
       - "5432:5432"
+    networks: [monitor]
 
   prometheus:
     image: prom/prometheus
+    restart: unless-stopped
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
+    depends_on:
+      - rabbitmq
+      - data-generator
+    networks: [monitor]
 
   grafana:
     image: grafana/grafana
+    restart: unless-stopped
     volumes:
       - ./grafana/provisioning/:/etc/grafana/provisioning/
     ports:
       - "3000:3000"
     depends_on:
       - prometheus
+    networks: [monitor]
 
   auth-service:
     build:
       context: .
       dockerfile: ./auth-service/Dockerfile
+    restart: unless-stopped
     volumes:
       - ./users.db:/app/users.db
     ports:
       - "8000:8000"
+    networks: [monitor]
 
   data-generator:
     build:
       context: .
       dockerfile: ./data-generator/Dockerfile
+    container_name: data-generator
+    restart: unless-stopped
     ports:
       - "9091:9091"
+    environment:
+      AMQP_ADDR: amqp://admin:admin@rabbitmq:5672/%2f
+      PG_CONN: host=db user=user password=password dbname=metrics_db
     depends_on:
       - db
       - auth-service
+      - rabbitmq
+    networks: [monitor]
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: admin
+      RABBITMQ_DEFAULT_PASS: admin
+    command: >
+      bash -lc "rabbitmq-plugins enable --offline rabbitmq_management rabbitmq_prometheus &&
+                rabbitmq-server"
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+      - "15692:15692"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [monitor]
+
+networks:
+  monitor: {}

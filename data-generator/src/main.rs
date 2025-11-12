@@ -1,74 +1,120 @@
-use actix_web::{get, App, HttpServer, Responder, HttpResponse};
-use tokio_postgres::{NoTls, Error};
-use std::time::Instant;
-use prometheus::{Encoder, TextEncoder, IntCounterVec, HistogramVec, register_int_counter_vec, register_histogram_vec};
+use actix_web::{get, App, HttpResponse, HttpServer, Responder};
+use anyhow::Result;
 use lazy_static::lazy_static;
+use lapin::{
+    options::{BasicPublishOptions, QueueDeclareOptions},
+    types::FieldTable,
+    BasicProperties, Channel, Connection, ConnectionProperties,
+};
+use prometheus::{
+    register_histogram_vec, register_int_counter_vec, Encoder, HistogramVec, IntCounterVec,
+    TextEncoder,
+};
 use rand::Rng;
+use std::{env, time::Duration};
+use tokio::time::sleep;
+use tokio_postgres::{Client, NoTls};
 
 lazy_static! {
-    static ref USER_ACTIONS_TOTAL: IntCounterVec =
-        register_int_counter_vec!(
-            "user_actions_total",
-            "Total number of user actions.",
-            &["action"]
-        ).unwrap();
+    static ref USER_ACTIONS_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "user_actions_total",
+        "Total number of user actions.",
+        &["action"]
+    )
+    .unwrap();
 
-    static ref DB_QUERY_LATENCY_SECONDS: HistogramVec =
-        register_histogram_vec!(
-            "db_query_latency_seconds",
-            "Latency of database queries in seconds.",
-            &["query_type"]
-        ).unwrap();
+    static ref DB_QUERY_LATENCY_SECONDS: HistogramVec = register_histogram_vec!(
+        "db_query_latency_seconds",
+        "Latency of database queries in seconds.",
+        &["query_type"]
+    )
+    .unwrap();
 }
 
-async fn insert_user_action(action: &str, user_id: i32) -> Result<(), Error> {
-    let (client, connection) = tokio_postgres::connect(
-        "host=db user=user password=password dbname=metrics_db", NoTls
-    ).await?;
-
+async fn connect_postgres() -> Result<Client> {
+    let conn_str = env::var("PG_CONN")
+        .unwrap_or_else(|_| "host=db user=user password=password dbname=metrics_db".into());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
+            eprintln!("postgres connection error: {e}");
         }
     });
+    Ok(client)
+}
 
+async fn connect_rabbitmq() -> Result<Channel> {
+    let addr = env::var("AMQP_ADDR")
+        .unwrap_or_else(|_| "amqp://admin:admin@rabbitmq:5672/%2f".into());
+    let conn = Connection::connect(&addr, ConnectionProperties::default()).await?;
+    let ch = conn.create_channel().await?;
+    ch.queue_declare(
+        "demo.queue",
+        QueueDeclareOptions::default(),
+        FieldTable::default(),
+    )
+        .await?;
+    Ok(ch)
+}
+
+async fn insert_user_action(client: &Client, action: &str, user_id: i32) -> Result<()> {
+    use std::time::Instant;
     let start = Instant::now();
     let query_type = "insert_user_action";
 
-    client.execute(
-        "INSERT INTO user_activity (user_id, action) VALUES ($1, $2)",
-        &[&user_id, &action],
-    ).await?;
+    client
+        .execute(
+            "INSERT INTO user_activity (user_id, action) VALUES ($1, $2)",
+            &[&user_id, &action],
+        )
+        .await?;
 
     let duration = start.elapsed().as_secs_f64();
-
     USER_ACTIONS_TOTAL.with_label_values(&[action]).inc();
-    DB_QUERY_LATENCY_SECONDS.with_label_values(&[query_type]).observe(duration);
+    DB_QUERY_LATENCY_SECONDS
+        .with_label_values(&[query_type])
+        .observe(duration);
 
-    println!("Action '{}' for user {} inserted in {:.4}s.", action, user_id, duration);
     Ok(())
 }
 
-fn run_simulation() {
-    let mut rng = rand::thread_rng();
-    let actions = vec!["login", "view_profile", "add_item", "logout"];
+async fn publish_action(ch: &Channel, action: &str, user_id: i32) -> Result<()> {
+    let payload = format!(r#"{{"user_id": {user_id}, "action": "{action}"}}"#);
+    ch.basic_publish(
+        "",
+        "demo.queue",
+        BasicPublishOptions::default(),
+        payload.as_bytes(),
+        BasicProperties::default(),
+    )
+        .await?
+        .await?;
+    Ok(())
+}
+
+async fn run_simulation(pg: Client, ch: Channel) {
+    let actions = ["login", "view_profile", "add_item", "logout"];
 
     loop {
-        let random_action = actions[rng.gen_range(0..actions.len())];
-        let random_user_id = rng.gen_range(1..100);
+        let (action, user_id) = {
+            let mut rng = rand::thread_rng();
+            let a = actions[rng.gen_range(0..actions.len())];
+            let u = rng.gen_range(1..100);
+            (a, u)
+        };
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        if let Err(e) = insert_user_action(&pg, action, user_id).await {
+            eprintln!("DB insert failed: {e}");
+        }
+        if let Err(e) = publish_action(&ch, action, user_id).await {
+            eprintln!("AMQP publish failed: {e}");
+        }
 
-        rt.block_on(async {
-            match insert_user_action(random_action, random_user_id).await {
-                Ok(_) => (),
-                Err(e) => eprintln!("Failed to insert data: {}", e),
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(rng.gen_range(500..2000))).await;
-        });
+        let ms = {
+            let mut rng = rand::thread_rng();
+            rng.gen_range(500..2000)
+        };
+        sleep(Duration::from_millis(ms)).await;
     }
 }
 
@@ -88,11 +134,12 @@ async fn metrics_handler() -> impl Responder {
 async fn main() -> std::io::Result<()> {
     println!("Data Generator Service is starting...");
 
-    tokio::task::spawn_blocking(run_simulation);
+    let pg = connect_postgres().await.expect("postgres connect failed");
+    let ch = connect_rabbitmq().await.expect("rabbitmq connect failed");
 
-    HttpServer::new(|| {
-        App::new().service(metrics_handler)
-    })
+    tokio::spawn(run_simulation(pg, ch));
+
+    HttpServer::new(|| App::new().service(metrics_handler))
         .bind(("0.0.0.0", 9091))?
         .run()
         .await

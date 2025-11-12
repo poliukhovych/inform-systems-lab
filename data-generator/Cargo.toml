@@ -11,3 +11,5 @@ rand = "0.8"
 prometheus = "0.13"
 actix-web = "4.0"
 lazy_static = "1.5.0"
+lapin = { version = "2", features = ["rustls"] }
+anyhow = "1"

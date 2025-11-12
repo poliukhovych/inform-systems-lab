@@ -1,4 +1,4 @@
-FROM rust:latest as builder
+FROM rust:latest AS builder
 WORKDIR /app/auth-service
 
 COPY ./auth-service/Cargo.toml .
